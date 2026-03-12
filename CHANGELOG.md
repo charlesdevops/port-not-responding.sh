@@ -66,6 +66,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - GitHub Actions workflow (`.github/workflows/ci.yml`) running `shellcheck` and `bash -n`
   on every push and pull request.
 - GitLab CI pipeline (`.gitlab-ci.yml`) with equivalent checks.
+- **`--k8s`** flag to enable Kubernetes diagnostics (requires `kubectl` in PATH).
+- **`--namespace`** flag to specify Kubernetes namespace to inspect (default: `default`).
+- `detect_k8s()` function to check for `kubectl` availability.
+- Kubernetes sections: kube-proxy status, CoreDNS/kube-dns status, CNI plugin pods
+  (Calico, Flannel, Cilium, Weave), Services and Endpoints, NetworkPolicy checks,
+  Ingress status, and pod-to-pod connectivity tests.
 
 ---
 
