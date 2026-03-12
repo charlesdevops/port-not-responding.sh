@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # ── Parse options and positional arguments ────────────────────
 # --no-color may appear anywhere in the argument list
@@ -80,11 +80,6 @@ _color() {
 # strip_ansi: removes ANSI escape sequences from stdin
 strip_ansi() {
   sed 's/\x1b\[[0-9;]*[mK]//g'
-}
-
-# log_raw: writes a plain-text line to the log file (ANSI-free)
-log_raw() {
-  printf '%s\n' "$*" | strip_ansi >> "$LOG_FILE"
 }
 
 # log: writes to stdout (with colors) AND to file (without colors)
@@ -801,7 +796,7 @@ if cmd_exists conntrack; then
   fi
 else
   log "conntrack CLI not available — install with: ${PKG_INSTALL} conntrack"
-  if [[ -f /proc/net/nf_conntrack ]]; then head -40 /proc/net/nf_conntrack | tee -a "$LOG_FILE" || true; fi
+  if [[ -f /proc/net/nf_conntrack ]]; then head -40 /proc/net/nf_conntrack | tee >(strip_ansi >> "$LOG_FILE") || true; fi
 fi
 
 sec "TCP parameters: backlog, syncookies, synack_retries"
@@ -860,14 +855,14 @@ sec "Kernel TCP statistics (overflow, drop, retransmit)"
 if cmd_exists netstat; then
   netstat -s 2>/dev/null \
     | grep -iE "syn|overflow|drop|reset|failed|retransmit|listen|backlog" \
-    | tee -a "$LOG_FILE" || true
+    | tee >(strip_ansi >> "$LOG_FILE") || true
 fi
 run "ss -s" || true
 if cmd_exists nstat; then
   run "nstat -az | grep -iE 'Syn|Listen|Drop|Overflow|Retrans'" || true
 else
-  if [[ -f /proc/net/snmp    ]]; then grep -E "^Tcp:"    /proc/net/snmp    | tee -a "$LOG_FILE" || true; fi
-  if [[ -f /proc/net/netstat ]]; then grep -E "^TcpExt:" /proc/net/netstat | tee -a "$LOG_FILE" || true; fi
+  if [[ -f /proc/net/snmp    ]]; then grep -E "^Tcp:"    /proc/net/snmp    | tee >(strip_ansi >> "$LOG_FILE") || true; fi
+  if [[ -f /proc/net/netstat ]]; then grep -E "^TcpExt:" /proc/net/netstat | tee >(strip_ansi >> "$LOG_FILE") || true; fi
 fi
 
 sec "Live SYN/SYN-ACK capture on port $TARGET_PORT (5 seconds)"
@@ -876,7 +871,8 @@ if cmd_exists tcpdump; then
   TCPDUMP_OUT=$(timeout 5 tcpdump -nn -i any \
     "tcp port ${TARGET_PORT} and (tcp[tcpflags] & (tcp-syn|tcp-ack) != 0)" \
     2>&1 || true)
-  echo "$TCPDUMP_OUT" | tee -a "$LOG_FILE"
+  echo "$TCPDUMP_OUT" | strip_ansi >> "$LOG_FILE"
+  echo "$TCPDUMP_OUT"
 
   SYN_COUNT=$(echo "$TCPDUMP_OUT"    | grep -c "Flags \[S\]"   || true)
   SYNACK_COUNT=$(echo "$TCPDUMP_OUT" | grep -c "Flags \[S\.\]" || true)
@@ -923,7 +919,7 @@ fi
 sec "System log (${SYSLOG_PATH})"
 if [[ -f "$SYSLOG_PATH" ]]; then
   grep -i "docker\|podman\|container\|iptables\|forward" "$SYSLOG_PATH" 2>/dev/null \
-    | tail -50 | tee -a "$LOG_FILE" || true
+    | tail -50 | tee >(strip_ansi >> "$LOG_FILE") || true
 else
   log "$SYSLOG_PATH not found on this machine"
 fi
@@ -931,7 +927,7 @@ fi
 if [[ "$DISTRO_FAMILY" == "redhat" ]] && [[ -f /var/log/audit/audit.log ]]; then
   sec "SELinux audit log (container denials)"
   grep -i "avc.*\(docker\|podman\|container\)\|denied.*\(docker\|podman\|container\)" \
-    /var/log/audit/audit.log 2>/dev/null | tail -30 | tee -a "$LOG_FILE" || true
+    /var/log/audit/audit.log 2>/dev/null | tail -30 | tee >(strip_ansi >> "$LOG_FILE") || true
 fi
 
 # ══════════════════════════════════════════════════════════════
