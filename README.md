@@ -58,6 +58,26 @@ CONTAINER_ENGINE=podman sudo -E bash port-not-responding.sh 8080
 
 ---
 
+## Quick install
+
+Download and run the script in one shot on any Linux machine:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/charlesdevops/port-not-responding.sh/main/port-not-responding.sh \
+  | sudo bash -s -- 8080
+```
+
+Or download it first, then run it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/charlesdevops/port-not-responding.sh/main/port-not-responding.sh \
+  -o port-not-responding.sh
+sudo bash port-not-responding.sh 8080
+```
+
+
+---
+
 ## What it checks
 
 ### Engine (auto-detected)
