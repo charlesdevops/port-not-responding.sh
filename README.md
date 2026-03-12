@@ -17,6 +17,17 @@ Before spending hours grepping through logs, run this script. It collects everyt
 
 ---
 
+## Quick install
+
+Download and run the script in one shot on any Linux machine:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/charlesdevops/port-not-responding.sh/main/port-not-responding.sh \
+  | sudo bash -s -- 8080
+```
+
+---
+
 ## Usage
 
 ```bash
@@ -67,26 +78,6 @@ K8S_NAMESPACE=production sudo -E bash port-not-responding.sh --k8s 8080
 
 - **stdout** — colour-coded summary with detected issues and suggested actions
 - `port-not-responding_<timestamp>.log` — full extended log, ANSI-free, grep/LLM-ready
-
----
-
-## Quick install
-
-Download and run the script in one shot on any Linux machine:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/charlesdevops/port-not-responding.sh/main/port-not-responding.sh \
-  | sudo bash -s -- 8080
-```
-
-Or download it first, then run it:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/charlesdevops/port-not-responding.sh/main/port-not-responding.sh \
-  -o port-not-responding.sh
-sudo bash port-not-responding.sh 8080
-```
-
 
 ---
 
