@@ -2,7 +2,7 @@
 # ============================================================
 #  port-not-responding.sh  v1.0.0
 #  Full diagnostics for a VM not responding on a port
-#  mapped to a container (Docker or Podman).
+#  mapped to a container (Docker, Podman, or Kubernetes).
 #
 #  Supported distros (auto-detection):
 #    - Ubuntu / Debian
@@ -10,17 +10,24 @@
 #    - VMware Photon OS
 #    - Generic fallback for any other Linux distro
 #
-#  Supported engines (auto-detection):
-#    - Docker   (daemon dockerd, docker-proxy, docker0)
-#    - Podman   (daemonless, rootful/rootless, netavark/CNI,
-#                pasta/slirp4netns, podman0/cni0)
+#  Supported container engines (auto-detection):
+#    - Docker      (daemon dockerd, docker-proxy, docker0)
+#    - Podman      (daemonless, rootful/rootless, netavark/CNI,
+#                   pasta/slirp4netns, podman0/cni0)
+#
+#  Kubernetes (opt-in via --k8s):
+#    - kubectl, NodePort/ClusterIP/LoadBalancer services,
+#      NetworkPolicy, kube-proxy, CNI pods
 #
 #  Usage: sudo bash port-not-responding.sh [OPTIONS] [PORT] [CONTAINER]
 #       PORT       – host port to test (default: 8000)
-#       CONTAINER  – container name or ID (default: auto-detect)
+#       CONTAINER  – container/pod name or ID (default: auto-detect)
 #
 #  Options:
 #    --no-color   Disable ANSI colors on stdout as well
+#    --k8s        Enable Kubernetes checks (requires kubectl in PATH)
+#    --namespace  Kubernetes namespace to inspect (default: default)
+#                 Can also be set via K8S_NAMESPACE env variable
 #
 #  Output:
 #    - Prints a human-readable SUMMARY with ANSI colors to stdout
@@ -33,15 +40,25 @@ set -euo pipefail
 VERSION="1.0.1"
 
 # ── Parse options and positional arguments ────────────────────
-# --no-color may appear anywhere in the argument list
+# --no-color / --k8s / --namespace may appear anywhere in the argument list
 NO_COLOR=false
+K8S_MODE=false
+K8S_NAMESPACE="${K8S_NAMESPACE:-default}"
 POSITIONAL=()
+_skip_next=false
 for arg in "$@"; do
-  if [[ "$arg" == "--no-color" ]]; then
-    NO_COLOR=true
-  else
-    POSITIONAL+=("$arg")
+  if [[ "$_skip_next" == true ]]; then
+    K8S_NAMESPACE="$arg"
+    _skip_next=false
+    continue
   fi
+  case "$arg" in
+    --no-color)  NO_COLOR=true ;;
+    --k8s)       K8S_MODE=true ;;
+    --namespace) _skip_next=true ;;
+    --namespace=*) K8S_NAMESPACE="${arg#--namespace=}" ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
 done
 
 TARGET_PORT="${POSITIONAL[0]:-8000}"
@@ -62,6 +79,10 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="./port-not-responding_${TIMESTAMP}.log"
 SUMMARY_ISSUES=()
 SUMMARY_HINTS=()
+
+# Kubernetes runtime state (populated by K8s sections when --k8s is used)
+K8S_POD=""
+K8S_SVC=""
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -229,6 +250,36 @@ detect_engine() {
 }
 
 # ──────────────────────────────────────────────────────────────
+# KUBERNETES DETECTION
+# Sets K8S_AVAILABLE, K8S_CONTEXT, K8S_SERVER_VERSION.
+# Only meaningful when K8S_MODE=true.
+# ──────────────────────────────────────────────────────────────
+detect_k8s() {
+  K8S_AVAILABLE="false"
+  K8S_CONTEXT=""
+  K8S_SERVER_VERSION=""
+
+  if ! cmd_exists kubectl; then
+    log "# kubectl          : not found in PATH"
+    if [[ "$K8S_MODE" == "true" ]]; then
+      warn "kubectl not found — Kubernetes checks require kubectl in PATH"
+      hint "Install kubectl: https://kubernetes.io/docs/tasks/tools/"
+    fi
+    return
+  fi
+
+  K8S_AVAILABLE="true"
+  K8S_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "N/A")
+  K8S_SERVER_VERSION=$(kubectl version --short 2>/dev/null \
+    | grep "Server Version" | awk '{print $3}' || echo "N/A")
+
+  log "# kubectl          : $(kubectl version --client --short 2>/dev/null | head -1 || echo 'found')"
+  log "# K8s context      : $K8S_CONTEXT"
+  log "# K8s server ver   : $K8S_SERVER_VERSION"
+  log "# K8s namespace    : $K8S_NAMESPACE"
+}
+
+# ──────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ──────────────────────────────────────────────────────────────
 require_root
@@ -237,10 +288,13 @@ log "# port-not-responding.sh  v${VERSION}"
 log "# Started          : $(date)"
 log "# Target port      : $TARGET_PORT"
 log "# Target container : ${TARGET_CONTAINER:-'(auto-detect)'}"
+log "# K8s mode         : $K8S_MODE"
+log "# K8s namespace    : $K8S_NAMESPACE"
 log "# Log file         : $LOG_FILE"
 
 detect_distro
 detect_engine
+detect_k8s
 
 # ══════════════════════════════════════════════════════════════
 hdr "1. SYSTEM INFORMATION"
@@ -426,6 +480,266 @@ if [[ -n "$TARGET_CONTAINER" && "$ENGINE" != "none" ]]; then
     fi
   fi
 fi
+
+# ══════════════════════════════════════════════════════════════
+# KUBERNETES SECTIONS (only when --k8s is passed)
+# ══════════════════════════════════════════════════════════════
+if [[ "$K8S_MODE" == "true" ]]; then
+
+  if [[ "$K8S_AVAILABLE" != "true" ]]; then
+    err "Kubernetes checks requested (--k8s) but kubectl is not available"
+    hint "Install kubectl: https://kubernetes.io/docs/tasks/tools/"
+  else
+
+# ──────────────────────────────────────────────────────────────
+hdr "3b. KUBERNETES – CLUSTER AND POD STATUS"
+# ──────────────────────────────────────────────────────────────
+
+sec "Cluster info"
+run "kubectl cluster-info 2>/dev/null" || true
+
+sec "Nodes"
+run "kubectl get nodes -o wide 2>/dev/null" || true
+
+sec "All pods in namespace '$K8S_NAMESPACE'"
+run "kubectl get pods -n $K8S_NAMESPACE -o wide 2>/dev/null" || true
+
+# ── Auto-detect pod matching TARGET_CONTAINER ────────────────
+sec "Auto-detect pod on port $TARGET_PORT (namespace: $K8S_NAMESPACE)"
+K8S_POD=""
+if [[ -n "$TARGET_CONTAINER" ]]; then
+  # Try exact name match first
+  K8S_POD=$(kubectl get pod -n "$K8S_NAMESPACE" "$TARGET_CONTAINER" \
+    --no-headers -o custom-columns=":metadata.name" 2>/dev/null || true)
+  if [[ -z "$K8S_POD" ]]; then
+    # Try prefix/substring match
+    K8S_POD=$(kubectl get pods -n "$K8S_NAMESPACE" --no-headers \
+      -o custom-columns=":metadata.name" 2>/dev/null \
+      | grep -m1 "$TARGET_CONTAINER" || true)
+  fi
+fi
+if [[ -z "$K8S_POD" ]]; then
+  # Try to find a pod exposing TARGET_PORT as a containerPort
+  K8S_POD=$(kubectl get pods -n "$K8S_NAMESPACE" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.containers[*]}{range .ports[*]}{.containerPort}{" "}{end}{end}{"\n"}{end}' \
+    2>/dev/null | awk -v p="$TARGET_PORT" '$0 ~ p {print $1; exit}' || true)
+fi
+if [[ -n "$K8S_POD" ]]; then
+  ok "Pod matched: $K8S_POD"
+else
+  warn "No pod matched for port $TARGET_PORT or name '$TARGET_CONTAINER' in namespace $K8S_NAMESPACE"
+  hint "List pods: kubectl get pods -n $K8S_NAMESPACE"
+fi
+
+# ── Pod details ──────────────────────────────────────────────
+if [[ -n "$K8S_POD" ]]; then
+  sec "Pod status: $K8S_POD"
+  POD_PHASE=$(kubectl get pod -n "$K8S_NAMESPACE" "$K8S_POD" \
+    -o jsonpath='{.status.phase}' 2>/dev/null || echo "N/A")
+  POD_READY=$(kubectl get pod -n "$K8S_NAMESPACE" "$K8S_POD" \
+    -o jsonpath='{range .status.containerStatuses[*]}{.ready}{" "}{end}' 2>/dev/null || echo "N/A")
+  POD_RESTARTS=$(kubectl get pod -n "$K8S_NAMESPACE" "$K8S_POD" \
+    -o jsonpath='{range .status.containerStatuses[*]}{.restartCount}{" "}{end}' 2>/dev/null || echo "0")
+  log "Phase   : $POD_PHASE"
+  log "Ready   : $POD_READY"
+  log "Restarts: $POD_RESTARTS"
+
+  if [[ "$POD_PHASE" != "Running" ]]; then
+    err "Pod '$K8S_POD' is NOT in Running phase (phase: $POD_PHASE)"
+    hint "Describe pod: kubectl describe pod -n $K8S_NAMESPACE $K8S_POD"
+    hint "Check events: kubectl get events -n $K8S_NAMESPACE --field-selector involvedObject.name=$K8S_POD"
+  else
+    ok "Pod '$K8S_POD' is Running"
+  fi
+
+  # Check for containers not ready
+  if echo "$POD_READY" | grep -q "false"; then
+    err "One or more containers in pod '$K8S_POD' are NOT ready"
+    hint "Check liveness/readiness probes: kubectl describe pod -n $K8S_NAMESPACE $K8S_POD"
+  fi
+
+  # Crash loop detection
+  for RC in $POD_RESTARTS; do
+    if [[ "$RC" =~ ^[0-9]+$ && "$RC" -gt 3 ]]; then
+      warn "Container restart count $RC — possible CrashLoopBackOff"
+      hint "Check logs: kubectl logs -n $K8S_NAMESPACE $K8S_POD --previous"
+      break
+    fi
+  done
+
+  sec "Pod describe: $K8S_POD"
+  run "kubectl describe pod -n $K8S_NAMESPACE $K8S_POD 2>/dev/null" || true
+
+  sec "Pod events: $K8S_POD"
+  run "kubectl get events -n $K8S_NAMESPACE --field-selector involvedObject.name=$K8S_POD --sort-by='.lastTimestamp' 2>/dev/null" || true
+
+  sec "Container port declarations in pod $K8S_POD"
+  CONTAINER_PORTS=$(kubectl get pod -n "$K8S_NAMESPACE" "$K8S_POD" \
+    -o jsonpath='{range .spec.containers[*]}{.name}{": "}{range .ports[*]}{.containerPort}/{.protocol}{" "}{end}{"\n"}{end}' \
+    2>/dev/null || echo "N/A")
+  log "$CONTAINER_PORTS"
+  if ! echo "$CONTAINER_PORTS" | grep -q "$TARGET_PORT"; then
+    warn "Port $TARGET_PORT not declared as a containerPort in pod $K8S_POD"
+    hint "Ensure the container exposes port $TARGET_PORT (containerPort in the pod spec)"
+  else
+    ok "Port $TARGET_PORT declared as containerPort"
+  fi
+
+  sec "Resource limits and requests: $K8S_POD"
+  run "kubectl get pod -n $K8S_NAMESPACE $K8S_POD -o jsonpath='{range .spec.containers[*]}{.name}{\"\\n  requests: \"}{.resources.requests}{\"\\n  limits:   \"}{.resources.limits}{\"\\n\"}{end}' 2>/dev/null" || true
+
+  sec "Liveness and readiness probes: $K8S_POD"
+  run "kubectl get pod -n $K8S_NAMESPACE $K8S_POD -o jsonpath='{range .spec.containers[*]}{.name}{\"\\n  liveness:  \"}{.livenessProbe}{\"\\n  readiness: \"}{.readinessProbe}{\"\\n\"}{end}' 2>/dev/null" || true
+fi
+
+# ── Services ─────────────────────────────────────────────────
+sec "Services in namespace '$K8S_NAMESPACE'"
+run "kubectl get svc -n $K8S_NAMESPACE -o wide 2>/dev/null" || true
+
+sec "Services exposing port $TARGET_PORT"
+K8S_SVC=$(kubectl get svc -n "$K8S_NAMESPACE" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.ports[*]}{.port}{" "}{.nodePort}{" "}{.targetPort}{" "}{end}{"\n"}{end}' \
+  2>/dev/null | awk -v p="$TARGET_PORT" '$0 ~ p {print $1; exit}' || true)
+
+if [[ -n "$K8S_SVC" ]]; then
+  ok "Service found for port $TARGET_PORT: $K8S_SVC"
+  run "kubectl describe svc -n $K8S_NAMESPACE $K8S_SVC 2>/dev/null" || true
+
+  # Check service type
+  SVC_TYPE=$(kubectl get svc -n "$K8S_NAMESPACE" "$K8S_SVC" \
+    -o jsonpath='{.spec.type}' 2>/dev/null || echo "N/A")
+  log "Service type: $SVC_TYPE"
+  case "$SVC_TYPE" in
+    NodePort)
+      NODE_PORT=$(kubectl get svc -n "$K8S_NAMESPACE" "$K8S_SVC" \
+        -o jsonpath='{range .spec.ports[?(@.port=='"$TARGET_PORT"')]}{.nodePort}{end}' \
+        2>/dev/null || true)
+      if [[ -n "$NODE_PORT" ]]; then
+        ok "NodePort: $NODE_PORT — accessible on every node at :<$NODE_PORT>"
+      else
+        warn "NodePort not found for port $TARGET_PORT in service $K8S_SVC"
+      fi
+      ;;
+    ClusterIP)
+      warn "Service '$K8S_SVC' is ClusterIP — only reachable inside the cluster"
+      hint "Expose externally: kubectl expose svc $K8S_SVC --type=NodePort -n $K8S_NAMESPACE"
+      hint "Or use port-forward: kubectl port-forward svc/$K8S_SVC $TARGET_PORT:$TARGET_PORT -n $K8S_NAMESPACE"
+      ;;
+    LoadBalancer)
+      LB_IP=$(kubectl get svc -n "$K8S_NAMESPACE" "$K8S_SVC" \
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+      if [[ -z "$LB_IP" ]]; then
+        warn "LoadBalancer service '$K8S_SVC' has no external IP yet (pending)"
+        hint "Check cloud provider LB provisioning; may take a few minutes"
+      else
+        ok "LoadBalancer external IP: $LB_IP"
+      fi
+      ;;
+    ExternalName)
+      warn "Service '$K8S_SVC' is ExternalName — it resolves to an external DNS name, not a pod"
+      ;;
+  esac
+
+  # Endpoints check
+  sec "Endpoints for service $K8S_SVC"
+  EP_OUT=$(kubectl get endpoints -n "$K8S_NAMESPACE" "$K8S_SVC" 2>/dev/null || true)
+  log "$EP_OUT"
+  if echo "$EP_OUT" | grep -qE "<none>|^$"; then
+    err "Service '$K8S_SVC' has NO endpoints — selector may not match any running pod"
+    hint "Check selector: kubectl describe svc -n $K8S_NAMESPACE $K8S_SVC"
+    hint "Check pod labels: kubectl get pods -n $K8S_NAMESPACE --show-labels"
+  else
+    ok "Endpoints present for service $K8S_SVC"
+  fi
+else
+  warn "No Service found exposing port $TARGET_PORT in namespace $K8S_NAMESPACE"
+  hint "Create a Service: kubectl expose pod $K8S_POD --port=$TARGET_PORT --type=NodePort -n $K8S_NAMESPACE"
+fi
+
+# ──────────────────────────────────────────────────────────────
+hdr "3c. KUBERNETES – NETWORKING (kube-proxy, NetworkPolicy, DNS)"
+# ──────────────────────────────────────────────────────────────
+
+sec "kube-proxy status"
+run "kubectl get pods -n kube-system -l k8s-app=kube-proxy -o wide 2>/dev/null" || true
+KPROXY_NOTREADY=$(kubectl get pods -n kube-system -l k8s-app=kube-proxy \
+  --no-headers 2>/dev/null | grep -v "Running" | grep -v "^$" || true)
+if [[ -n "$KPROXY_NOTREADY" ]]; then
+  err "One or more kube-proxy pods are NOT running:"
+  log "$KPROXY_NOTREADY"
+  hint "Describe kube-proxy pod: kubectl describe pod -n kube-system <pod-name>"
+else
+  ok "kube-proxy pods appear healthy"
+fi
+
+sec "CoreDNS / kube-dns status"
+run "kubectl get pods -n kube-system -l k8s-app=kube-dns -o wide 2>/dev/null" || true
+
+sec "CNI plugin pods (calico / flannel / cilium / weave)"
+for CNI_LABEL in k8s-app=calico-node app=flannel k8s-app=cilium app=weave-net; do
+  CNI_PODS=$(kubectl get pods -n kube-system -l "$CNI_LABEL" --no-headers 2>/dev/null || true)
+  if [[ -n "$CNI_PODS" ]]; then
+    log "CNI ($CNI_LABEL):"
+    log "$CNI_PODS"
+    if echo "$CNI_PODS" | grep -v "Running" | grep -qv "^$"; then
+      err "CNI pod(s) not Running for label $CNI_LABEL"
+      hint "Describe CNI pod: kubectl describe pod -n kube-system -l $CNI_LABEL"
+    else
+      ok "CNI pods running ($CNI_LABEL)"
+    fi
+  fi
+done
+
+sec "NetworkPolicies in namespace '$K8S_NAMESPACE'"
+NP_OUT=$(kubectl get networkpolicy -n "$K8S_NAMESPACE" 2>/dev/null || true)
+log "$NP_OUT"
+if echo "$NP_OUT" | grep -qv "^No resources\|^$"; then
+  warn "NetworkPolicies exist in namespace $K8S_NAMESPACE — they may block traffic to port $TARGET_PORT"
+  run "kubectl describe networkpolicy -n $K8S_NAMESPACE 2>/dev/null" || true
+  hint "Verify that a NetworkPolicy allows ingress on port $TARGET_PORT to the target pod"
+  hint "Example allow-ingress policy: https://kubernetes.io/docs/concepts/services-networking/network-policies/"
+else
+  ok "No NetworkPolicies in namespace $K8S_NAMESPACE (traffic unrestricted at policy level)"
+fi
+
+sec "Ingress resources in namespace '$K8S_NAMESPACE'"
+run "kubectl get ingress -n $K8S_NAMESPACE -o wide 2>/dev/null" || true
+
+sec "All services across all namespaces (overview)"
+run "kubectl get svc --all-namespaces 2>/dev/null" || true
+
+# ──────────────────────────────────────────────────────────────
+hdr "3d. KUBERNETES – LOGS AND EVENTS"
+# ──────────────────────────────────────────────────────────────
+
+if [[ -n "$K8S_POD" ]]; then
+  sec "Pod logs (last 80 lines): $K8S_POD"
+  # Get all container names in the pod
+  K8S_CONTAINERS=$(kubectl get pod -n "$K8S_NAMESPACE" "$K8S_POD" \
+    -o jsonpath='{range .spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
+  for CTR in $K8S_CONTAINERS; do
+    log "── Container: $CTR ──"
+    run "kubectl logs -n $K8S_NAMESPACE $K8S_POD -c $CTR --tail=80 --timestamps 2>/dev/null" || true
+  done
+
+  sec "Previous container logs (if restarted): $K8S_POD"
+  for CTR in $K8S_CONTAINERS; do
+    PREV_LOGS=$(kubectl logs -n "$K8S_NAMESPACE" "$K8S_POD" -c "$CTR" --previous --tail=40 2>/dev/null || true)
+    if [[ -n "$PREV_LOGS" ]]; then
+      log "── Previous logs for container $CTR ──"
+      log "$PREV_LOGS"
+    fi
+  done
+fi
+
+sec "Recent events in namespace '$K8S_NAMESPACE' (warnings)"
+run "kubectl get events -n $K8S_NAMESPACE --field-selector type=Warning --sort-by='.lastTimestamp' 2>/dev/null | tail -30" || true
+
+sec "All recent events in namespace '$K8S_NAMESPACE'"
+run "kubectl get events -n $K8S_NAMESPACE --sort-by='.lastTimestamp' 2>/dev/null | tail -40" || true
+
+  fi  # end K8S_AVAILABLE check
+fi    # end K8S_MODE check
 
 # ══════════════════════════════════════════════════════════════
 hdr "4. HOST NETWORKING – PORTS AND SOCKETS"
@@ -966,6 +1280,12 @@ log "$(_color "${BOLD}${CYAN}" "║           DETECTED ISSUES SUMMARY           
 log "$(_color "${BOLD}${CYAN}" "╚══════════════════════════════════════════════════════════╝")"
 log "  Engine : ${ENGINE}  |  Rootless: ${ENGINE_ROOTLESS:-N/A}  |  Net backend: ${ENGINE_NET_BACKEND:-N/A}"
 log "  Distro : ${PRETTY_NAME} (${DISTRO_FAMILY})"
+if [[ "$K8S_MODE" == "true" ]]; then
+  log "  K8s    : context=${K8S_CONTEXT:-N/A}  |  namespace=${K8S_NAMESPACE}  |  server=${K8S_SERVER_VERSION:-N/A}"
+  if [[ -n "${K8S_POD:-}" ]]; then
+    log "  Pod    : ${K8S_POD}  |  Service: ${K8S_SVC:-N/A}"
+  fi
+fi
 
 if [[ ${#SUMMARY_ISSUES[@]} -eq 0 ]]; then
   log ""
@@ -1011,6 +1331,21 @@ log "  22. tcp_syncookies=0 under SYN flood"
 log "  23. tcp_max_syn_backlog or somaxconn too low"
 log "  24. rp_filter=1 strict on interface with asymmetric routing"
 log "  25. Recv-Q > 0 — application slow to accept connections"
+if [[ "$K8S_MODE" == "true" ]]; then
+log "  ── KUBERNETES SPECIFIC ───────────────────────────────────────"
+log "  26. Pod not in Running phase (Pending/CrashLoopBackOff/Error)"
+log "  27. Container not ready — liveness/readiness probe failing"
+log "  28. No Service (or wrong selector) — endpoints list is empty"
+log "  29. Service type is ClusterIP — not reachable from outside cluster"
+log "  30. NodePort not open in cloud Security Group / firewall"
+log "  31. LoadBalancer external IP still pending (cloud provisioning)"
+log "  32. NetworkPolicy blocking ingress to pod on port $TARGET_PORT"
+log "  33. kube-proxy pod not running — iptables/ipvs rules not updated"
+log "  34. CNI plugin (Calico/Flannel/Cilium) pod not running"
+log "  35. containerPort not declared in pod spec — Service cannot route"
+log "  36. Resource limits (CPU/memory) causing OOMKilled or throttling"
+log "  37. Ingress controller misconfigured or not running"
+fi
 
 if [[ ${#SUMMARY_HINTS[@]} -gt 0 ]]; then
   log ""
@@ -1026,6 +1361,12 @@ log "$(_color "${BOLD}" "Analysed port:    ") ${TARGET_PORT}"
 log "$(_color "${BOLD}" "Container:        ") ${TARGET_CONTAINER:-'(none detected)'}"
 log "$(_color "${BOLD}" "Engine:           ") ${ENGINE} (rootless: ${ENGINE_ROOTLESS:-N/A}, backend: ${ENGINE_NET_BACKEND:-N/A})"
 log "$(_color "${BOLD}" "Distro:           ") ${PRETTY_NAME} (${DISTRO_FAMILY})"
+if [[ "$K8S_MODE" == "true" ]]; then
+  log "$(_color "${BOLD}" "K8s context:      ") ${K8S_CONTEXT:-N/A}"
+  log "$(_color "${BOLD}" "K8s namespace:    ") ${K8S_NAMESPACE}"
+  log "$(_color "${BOLD}" "K8s pod:          ") ${K8S_POD:-'(none detected)'}"
+  log "$(_color "${BOLD}" "K8s service:      ") ${K8S_SVC:-'(none detected)'}"
+fi
 log "$(_color "${BOLD}" "Timestamp:        ") $(date)"
 log ""
 

@@ -3,6 +3,7 @@
 > Bash diagnostic script for Linux VMs where a container port isn't responding.
 >
 > Auto-detects Docker/Podman (rootful & rootless), adapts to Ubuntu/Debian/RedHat/Photon.
+> Optionally runs Kubernetes checks (pods, services, endpoints, NetworkPolicies, kube-proxy, CNI) with `--k8s`.
 >
 > Checks firewalls, conntrack, TCP handshake (SYN/SYN-ACK), rp_filter and captures live traffic with tcpdump... Among other things.
 
@@ -22,21 +23,23 @@ Before spending hours grepping through logs, run this script. It collects everyt
 sudo bash port-not-responding.sh [OPTIONS] [PORT] [CONTAINER]
 ```
 
-| Argument      | Description                                     | Default     |
-| ------------- | ----------------------------------------------- | ----------- |
-| `PORT`      | Host port to test                               | `8000`    |
-| `CONTAINER` | Container name or ID (auto-detected if omitted) | auto-detect |
+| Argument      | Description                                              | Default     |
+| ------------- | -------------------------------------------------------- | ----------- |
+| `PORT`      | Host port to test                                        | `8000`    |
+| `CONTAINER` | Container/pod name or ID (auto-detected if omitted)      | auto-detect |
 
 **Options**
 
-| Flag           | Description                                                                  |
-| -------------- | ---------------------------------------------------------------------------- |
-| `--no-color` | Disable ANSI colors (useful in CI); may appear anywhere in the argument list |
+| Flag                    | Description                                                                                    |
+| ----------------------- | ---------------------------------------------------------------------------------------------- |
+| `--no-color`          | Disable ANSI colors (useful in CI); may appear anywhere in the argument list                   |
+| `--k8s`               | Enable Kubernetes checks (requires `kubectl` in PATH)                                        |
+| `--namespace <ns>`    | Kubernetes namespace to inspect (default: `default`); also settable via `K8S_NAMESPACE` env |
 
 **Examples**
 
 ```bash
-# Test port 8080, auto-detect container
+# Test port 8080, auto-detect container (Docker/Podman)
 sudo bash port-not-responding.sh 8080
 
 # Test port 443 on a specific container
@@ -49,6 +52,15 @@ sudo bash port-not-responding.sh 8080 my-nginx --no-color
 
 # Force a specific engine when both Docker and Podman are installed
 CONTAINER_ENGINE=podman sudo -E bash port-not-responding.sh 8080
+
+# Kubernetes: check port 8080 in the default namespace
+sudo bash port-not-responding.sh --k8s 8080
+
+# Kubernetes: check port 8080 for a specific pod in a specific namespace
+sudo bash port-not-responding.sh --k8s --namespace my-app 8080 my-pod
+
+# Kubernetes: set namespace via environment variable
+K8S_NAMESPACE=production sudo -E bash port-not-responding.sh --k8s 8080
 ```
 
 **Output**
@@ -80,14 +92,24 @@ sudo bash port-not-responding.sh 8080
 
 ## What it checks
 
-### Engine (auto-detected)
+### Container engine (auto-detected)
 
 Docker is preferred when both Docker and Podman are installed. Override with `CONTAINER_ENGINE=podman`.
 
-| Engine | Supported modes                                             |
-| ------ | ----------------------------------------------------------- |
-| Docker | rootful,`docker-proxy`, `docker0` bridge                |
-| Podman | rootful, rootless, Netavark, CNI,`pasta`, `slirp4netns` |
+| Engine | Supported modes                                                             |
+| ------ | --------------------------------------------------------------------------- |
+| Docker | rootful, `docker-proxy`, `docker0` bridge                                 |
+| Podman | rootful, rootless, Netavark, CNI, `pasta`, `slirp4netns`                 |
+
+### Kubernetes (opt-in via `--k8s`)
+
+Enabled with the `--k8s` flag. Checks pods, services, endpoints, NetworkPolicies, kube-proxy, and CNI plugins.
+
+| Service type   | Notes                                              |
+| -------------- | -------------------------------------------------- |
+| `NodePort`   | Host port reachability, firewall rules             |
+| `ClusterIP`  | Internal-only; not reachable from outside cluster  |
+| `LoadBalancer` | External IP provisioning status                  |
 
 ### Distro (auto-detected)
 
@@ -100,35 +122,39 @@ Docker is preferred when both Docker and Podman are installed. Override with `CO
 
 ### Checks performed
 
-| #  | Area          | What is verified                                                                                           |
-| -- | ------------- | ---------------------------------------------------------------------------------------------------------- |
-| 1  | System        | OS, kernel, uptime, memory, disk                                                                           |
-| 2  | Engine        | daemon status, version, rootless specifics, user namespaces                                                |
-| 3  | Container     | running state, crash loop, port mapping, inspect, logs                                                     |
-| 4  | Networking    | listening socket, bind address,`docker-proxy` / `pasta` / `slirp4netns`                              |
-| 5  | Firewall      | `ufw`, `firewalld`, SELinux, `iptables`, `ip6tables`, `nftables`                                 |
-| 6  | Daemon config | `daemon.json`, `containers.conf`, ip_forward, bridge-nf-call-iptables, Netavark/CNI                    |
-| 7  | Connectivity  | `curl` and `nc` against localhost                                                                      |
-| 8  | TCP handshake | `conntrack` table usage, SYN backlog, `somaxconn`, `tcp_syncookies`, `rp_filter`, live `tcpdump` |
-| 9  | Logs          | `journalctl`, `dmesg`, syslog / messages, SELinux audit log                                            |
-| 10 | Cloud         | Security Group reminder, AWS/GCP/Azure instance metadata                                                   |
+| #   | Area              | What is verified                                                                                           |
+| --- | ----------------- | ---------------------------------------------------------------------------------------------------------- |
+| 1   | System            | OS, kernel, uptime, memory, disk                                                                           |
+| 2   | Engine            | daemon status, version, rootless specifics, user namespaces                                                |
+| 3   | Container         | running state, crash loop, port mapping, inspect, logs                                                     |
+| 3b  | K8s pod/service   | pod phase, readiness, restarts, containerPort, Service type, Endpoints *(--k8s)*                         |
+| 3c  | K8s networking    | kube-proxy, CoreDNS, CNI pods, NetworkPolicy, Ingress *(--k8s)*                                          |
+| 3d  | K8s logs/events   | `kubectl logs`, previous container logs, Warning events *(--k8s)*                                       |
+| 4   | Networking        | listening socket, bind address, `docker-proxy` / `pasta` / `slirp4netns`                              |
+| 5   | Firewall          | `ufw`, `firewalld`, SELinux, `iptables`, `ip6tables`, `nftables`                                 |
+| 6   | Daemon config     | `daemon.json`, `containers.conf`, ip_forward, bridge-nf-call-iptables, Netavark/CNI                    |
+| 7   | Connectivity      | `curl` and `nc` against localhost                                                                      |
+| 8   | TCP handshake     | `conntrack` table usage, SYN backlog, `somaxconn`, `tcp_syncookies`, `rp_filter`, live `tcpdump` |
+| 9   | Logs              | `journalctl`, `dmesg`, syslog / messages, SELinux audit log                                            |
+| 10  | Cloud             | Security Group reminder, AWS/GCP/Azure instance metadata                                                   |
 
 ---
 
 ## Requirements
 
-| Tool                     | Required         | Notes                                |
-| ------------------------ | ---------------- | ------------------------------------ |
-| `bash`                 | ✅ >= 4.0        |                                      |
-| `ss`                   | ✅               | Part of `iproute2`                 |
-| `ip`                   | ✅               | Part of `iproute2`                 |
-| `iptables`             | ✅               |                                      |
-| `docker` or `podman` | ✅               | At least one must be present         |
-| `curl`                 | ⚠️ recommended | Used for localhost connectivity test |
-| `nc`                   | ⚠️ recommended | Used for port reachability test      |
-| `tcpdump`              | ⚠️ recommended | Used for live SYN/SYN-ACK capture    |
-| `conntrack`            | ⚠️ recommended | Used for conntrack table analysis    |
-| `nft`                  | optional         | Used if nftables is active           |
+| Tool                     | Required         | Notes                                                    |
+| ------------------------ | ---------------- | -------------------------------------------------------- |
+| `bash`                 | ✅ >= 4.0        |                                                          |
+| `ss`                   | ✅               | Part of `iproute2`                                     |
+| `ip`                   | ✅               | Part of `iproute2`                                     |
+| `iptables`             | ✅               |                                                          |
+| `docker` or `podman` | ✅ *             | At least one must be present (not required with `--k8s`) |
+| `kubectl`              | ✅ with `--k8s` | Required only when `--k8s` flag is passed              |
+| `curl`                 | ⚠️ recommended | Used for localhost connectivity test                     |
+| `nc`                   | ⚠️ recommended | Used for port reachability test                          |
+| `tcpdump`              | ⚠️ recommended | Used for live SYN/SYN-ACK capture                        |
+| `conntrack`            | ⚠️ recommended | Used for conntrack table analysis                        |
+| `nft`                  | optional         | Used if nftables is active                               |
 
 The script runs without the optional tools — it logs a warning and skips those checks.
 
@@ -169,6 +195,20 @@ The script runs without the optional tools — it logs a warning and skips those
 23. `tcp_max_syn_backlog` or `somaxconn` too low
 24. `rp_filter=1` strict mode on interface with asymmetric routing
 25. `Recv-Q > 0` — application slow to accept connections
+
+**Kubernetes-specific** *(requires `--k8s`)*
+26. Pod not in Running phase (`Pending` / `CrashLoopBackOff` / `Error`)
+27. Container not ready — liveness or readiness probe failing
+28. No Service, or Service selector does not match pod labels — endpoints list is empty
+29. Service type is `ClusterIP` — not reachable from outside the cluster
+30. `NodePort` not open in cloud Security Group / host firewall
+31. `LoadBalancer` external IP still pending (cloud provisioner not ready)
+32. `NetworkPolicy` blocking ingress to the pod on the target port
+33. `kube-proxy` pod not running — iptables/ipvs rules not updated
+34. CNI plugin pod (Calico / Flannel / Cilium / Weave) not running
+35. `containerPort` not declared in pod spec — Service cannot route traffic
+36. Resource limits (CPU/memory) causing `OOMKilled` or CPU throttling
+37. Ingress controller misconfigured or not running
 
 ---
 
