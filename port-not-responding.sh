@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  container_port_diagnostics.sh
+#  port-not-responding.sh  v1.0.0
 #  Full diagnostics for a VM not responding on a port
 #  mapped to a container (Docker or Podman).
 #
@@ -15,23 +15,49 @@
 #    - Podman   (daemonless, rootful/rootless, netavark/CNI,
 #                pasta/slirp4netns, podman0/cni0)
 #
-#  Usage: sudo bash port-not-responding.sh [PORT] [CONTAINER]
+#  Usage: sudo bash port-not-responding.sh [OPTIONS] [PORT] [CONTAINER]
 #       PORT       – host port to test (default: 8000)
 #       CONTAINER  – container name or ID (default: auto-detect)
+#
+#  Options:
+#    --no-color   Disable ANSI colors on stdout as well
 #
 #  Output:
 #    - Prints a human-readable SUMMARY with ANSI colors to stdout
 #    - Writes an extended log to ./port-not-responding_<timestamp>.log
 #      (log is ANSI-free for grep/LLM-friendliness)
-#
-#  Options:
-#    --no-color   Disable colors on stdout as well
 # ============================================================
 
 set -euo pipefail
 
-TARGET_PORT="${1:-8000}"
-TARGET_CONTAINER="${2:-}"
+VERSION="1.0.0"
+
+# ── Parse options and positional arguments ────────────────────
+# --no-color may appear anywhere in the argument list
+NO_COLOR=false
+POSITIONAL=()
+for arg in "$@"; do
+  if [[ "$arg" == "--no-color" ]]; then
+    NO_COLOR=true
+  else
+    POSITIONAL+=("$arg")
+  fi
+done
+
+TARGET_PORT="${POSITIONAL[0]:-8000}"
+TARGET_CONTAINER="${POSITIONAL[1]:-}"
+
+# ── Input validation ──────────────────────────────────────────
+if ! [[ "$TARGET_PORT" =~ ^[0-9]+$ ]] || (( TARGET_PORT < 1 || TARGET_PORT > 65535 )); then
+  echo "Error: PORT must be a number between 1 and 65535 (got: '$TARGET_PORT')" >&2
+  exit 1
+fi
+# Allow letters, digits, underscore, dot, hyphen — dot is literal inside []
+if [[ -n "$TARGET_CONTAINER" ]] && ! [[ "$TARGET_CONTAINER" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+  echo "Error: CONTAINER name contains invalid characters: '$TARGET_CONTAINER'" >&2
+  exit 1
+fi
+
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="./port-not-responding_${TIMESTAMP}.log"
 SUMMARY_ISSUES=()
@@ -39,38 +65,38 @@ SUMMARY_HINTS=()
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
-NO_COLOR=false
 
-# Handle --no-color flag
-for arg in "$@"; do
-  [[ "$arg" == "--no-color" ]] && NO_COLOR=true
-done
-
-# Apply colors to stdout only, never to the log file
+# ── Color helpers ─────────────────────────────────────────────
+# _color: wraps text in ANSI codes; respects NO_COLOR
 _color() {
   local code="$1"; shift
-  if [[ "$NO_COLOR" == "false" ]]; then
+  if [[ "$NO_COLOR" == false ]]; then
     echo -e "${code}${*}${RESET}"
   else
     echo "$*"
   fi
 }
 
-# log_raw: writes to log file WITHOUT ANSI sequences
+# strip_ansi: removes ANSI escape sequences from stdin
+strip_ansi() {
+  sed 's/\x1b\[[0-9;]*[mK]//g'
+}
+
+# log_raw: writes a plain-text line to the log file (ANSI-free)
 log_raw() {
-  # Strip ANSI escapes before writing to file (printf is POSIX-safe)
-  printf '%b\n' "$*" | sed 's/\x1b\[[0-9;]*m//g; s/\\033\[[0-9;]*m//g' >> "$LOG_FILE"
+  printf '%s\n' "$*" | strip_ansi >> "$LOG_FILE"
 }
 
 # log: writes to stdout (with colors) AND to file (without colors)
 log() {
   local msg="$*"
-  if [[ "$NO_COLOR" == "false" ]]; then
+  if [[ "$NO_COLOR" == false ]]; then
     echo -e "$msg"
   else
-    echo -e "$msg" | sed 's/\x1b\[[0-9;]*m//g'
+    echo -e "$msg" | strip_ansi
   fi
-  log_raw "$msg"
+  # Always write ANSI-free to the log file
+  printf '%s\n' "$msg" | strip_ansi >> "$LOG_FILE"
 }
 
 hdr() {
@@ -85,15 +111,18 @@ warn() { log "$(_color "${YELLOW}" "[WARN] $*")"; SUMMARY_ISSUES+=("⚠  $*"); }
 err()  { log "$(_color "${RED}"    "[ERR]  $*")"; SUMMARY_ISSUES+=("✗  $*"); }
 hint() { SUMMARY_HINTS+=("→  $*"); }
 
-# run: executes command, writes stdout+stderr to both screen and file (ANSI-free)
+# run: executes a command string, writes stdout+stderr to screen and log (ANSI-free).
+# NOTE: uses bash -c to support pipes/globs in command strings; user-supplied
+# values (TARGET_PORT, TARGET_CONTAINER) are validated at startup to prevent injection.
 run() {
   log "$(_color "${BOLD}" "$ $*")"
-  eval "$*" 2>&1 | tee -a "$LOG_FILE" || true
+  # Strip ANSI from command output before appending to log file
+  bash -c "$1" 2>&1 | tee >(strip_ansi >> "$LOG_FILE") || true
 }
 
 require_root() {
   if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}Questo script richiede i privilegi di root. Rieseguire con sudo.${RESET}"
+    echo "Error: this script requires root privileges. Re-run with sudo." >&2
     exit 1
   fi
 }
@@ -105,7 +134,7 @@ cmd_exists() { command -v "$1" &>/dev/null; }
 # ──────────────────────────────────────────────────────────────
 detect_distro() {
   DISTRO_ID=""; DISTRO_FAMILY=""; PKG_INSTALL=""; SYSLOG_PATH=""
-  PRETTY_NAME=""; DISTRO_ID_LIKE=""
+  PRETTY_NAME="unknown"; DISTRO_ID_LIKE=""
 
   if [[ -f /etc/os-release ]]; then
     # shellcheck source=/dev/null
@@ -139,28 +168,35 @@ detect_distro() {
 
 # ──────────────────────────────────────────────────────────────
 # ENGINE DETECTION (Docker vs Podman)
+# Priority: Docker is checked first; if both are installed,
+# Docker takes precedence (it has a persistent daemon to check).
+# Override by passing CONTAINER_ENGINE=podman in the environment.
 # ──────────────────────────────────────────────────────────────
 detect_engine() {
-  ENGINE=""          # "docker" | "podman"
-  ENGINE_BIN=""      # path al binario
-  ENGINE_ROOTLESS="" # "true" | "false"
-  ENGINE_NET_BACKEND=""  # "netavark" | "cni" | "docker-proxy" | "unknown"
-  ENGINE_BRIDGE=""   # nome interfaccia bridge (docker0 / podman0 / cni0)
+  ENGINE=""          # "docker" | "podman" | "none"
+  ENGINE_BIN=""      # path to the binary
+  ENGINE_ROOTLESS="" # "true" | "false" | ""
+  ENGINE_NET_BACKEND=""  # "netavark" | "cni" | "docker-proxy" | "unknown" | ""
+  ENGINE_BRIDGE=""   # bridge interface name (docker0 / podman0 / cni0)
 
-  if cmd_exists podman; then
-    ENGINE="podman"
-    ENGINE_BIN="podman"
+  local preferred="${CONTAINER_ENGINE:-}"
+
+  if [[ -n "$preferred" ]] && cmd_exists "$preferred"; then
+    ENGINE="$preferred"
+    ENGINE_BIN="$preferred"
   elif cmd_exists docker; then
     ENGINE="docker"
     ENGINE_BIN="docker"
+  elif cmd_exists podman; then
+    ENGINE="podman"
+    ENGINE_BIN="podman"
   else
     ENGINE="none"
     ENGINE_BIN=""
   fi
 
   if [[ "$ENGINE" == "podman" ]]; then
-    # Rootless: if the daemon runs as non-root or we use podman rootless
-    # When running as root (sudo), podman is rootful
+    # Rootless: when running as non-root
     if [[ $EUID -eq 0 ]]; then
       ENGINE_ROOTLESS="false"
     else
@@ -168,29 +204,33 @@ detect_engine() {
     fi
 
     # Network backend
-    NET_BACKEND_RAW=$(podman info --format '{{.Host.NetworkBackend}}' 2>/dev/null || echo "unknown")
-    ENGINE_NET_BACKEND="$NET_BACKEND_RAW"
+    ENGINE_NET_BACKEND=$(podman info --format '{{.Host.NetworkBackend}}' 2>/dev/null || echo "unknown")
 
     # Bridge interface
-    if ip link show podman0 &>/dev/null 2>&1; then
+    if ip link show podman0 &>/dev/null; then
       ENGINE_BRIDGE="podman0"
-    elif ip link show cni0 &>/dev/null 2>&1; then
+    elif ip link show cni0 &>/dev/null; then
       ENGINE_BRIDGE="cni0"
     else
-      ENGINE_BRIDGE="(non rilevata)"
+      ENGINE_BRIDGE="(not detected)"
     fi
 
   elif [[ "$ENGINE" == "docker" ]]; then
     ENGINE_ROOTLESS="false"
     ENGINE_NET_BACKEND="docker-proxy"
     ENGINE_BRIDGE="docker0"
+  else
+    # ENGINE == "none" — initialise all variables to safe defaults
+    ENGINE_ROOTLESS=""
+    ENGINE_NET_BACKEND=""
+    ENGINE_BRIDGE=""
   fi
 
   log "# Detected engine : ${ENGINE}"
   log "# Binary          : ${ENGINE_BIN:-N/A}"
-  log "# Rootless        : ${ENGINE_ROOTLESS}"
-  log "# Network backend : ${ENGINE_NET_BACKEND}"
-  log "# Bridge iface    : ${ENGINE_BRIDGE}"
+  log "# Rootless        : ${ENGINE_ROOTLESS:-N/A}"
+  log "# Network backend : ${ENGINE_NET_BACKEND:-N/A}"
+  log "# Bridge iface    : ${ENGINE_BRIDGE:-N/A}"
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -198,11 +238,11 @@ detect_engine() {
 # ──────────────────────────────────────────────────────────────
 require_root
 
-log "# port-not-responding.sh"
+log "# port-not-responding.sh  v${VERSION}"
 log "# Started          : $(date)"
-log "# Target port     : $TARGET_PORT"
-log "# Target container: ${TARGET_CONTAINER:-'(auto-detect)'}"
-log "# Log file        : $LOG_FILE"
+log "# Target port      : $TARGET_PORT"
+log "# Target container : ${TARGET_CONTAINER:-'(auto-detect)'}"
+log "# Log file         : $LOG_FILE"
 
 detect_distro
 detect_engine
@@ -239,7 +279,7 @@ if [[ "$ENGINE" == "none" ]]; then
     *)      hint "See https://docs.docker.com/engine/install/ or https://podman.io/docs/installation" ;;
   esac
 else
-  ok "Engine found: $ENGINE — $($ENGINE_BIN --version 2>/dev/null || echo 'versione N/A')"
+  ok "Engine found: $ENGINE — $($ENGINE_BIN --version 2>/dev/null || echo 'version N/A')"
 fi
 
 # ── Daemon status (only Docker has a persistent daemon) ─────
@@ -258,7 +298,7 @@ elif [[ "$ENGINE" == "podman" ]]; then
   sec "Podman is daemonless — no persistent daemon"
   ok "Podman does not require an active daemon to run containers"
 
-  # Podman socket (usato da alcuni orchestratori e da podman-compose)
+  # Podman socket (used by some orchestrators and by podman-compose)
   sec "Podman socket (podman.socket)"
   if systemctl is-active --quiet podman.socket 2>/dev/null; then
     ok "podman.socket is active (Docker-compatible API available)"
@@ -266,7 +306,7 @@ elif [[ "$ENGINE" == "podman" ]]; then
     log "podman.socket not active (normal if not used by orchestrators)"
   fi
 
-  # Podman system service (API REST)
+  # Podman system service (REST API)
   sec "Podman system service"
   if systemctl is-active --quiet podman 2>/dev/null; then
     ok "podman service active"
@@ -276,8 +316,10 @@ elif [[ "$ENGINE" == "podman" ]]; then
 fi
 
 sec "Engine version and info"
-run "$ENGINE_BIN version" || true
-run "$ENGINE_BIN info"    || true
+if [[ "$ENGINE" != "none" ]]; then
+  run "$ENGINE_BIN version" || true
+  run "$ENGINE_BIN info"    || true
+fi
 
 # ── Podman: rootless specifics ───────────────────────────────
 if [[ "$ENGINE" == "podman" && "$ENGINE_ROOTLESS" == "true" ]]; then
@@ -311,10 +353,12 @@ hdr "3. CONTAINER STATUS"
 # ══════════════════════════════════════════════════════════════
 
 sec "All containers (including stopped)"
-run "$ENGINE_BIN ps -a --format 'table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'" || true
+if [[ "$ENGINE" != "none" ]]; then
+  run "$ENGINE_BIN ps -a --format 'table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'" || true
+fi
 
 sec "Auto-detect container on port $TARGET_PORT"
-if [[ -z "$TARGET_CONTAINER" ]]; then
+if [[ "$ENGINE" != "none" && -z "$TARGET_CONTAINER" ]]; then
   TARGET_CONTAINER=$($ENGINE_BIN ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null \
     | grep ":${TARGET_PORT}->" | awk '{print $1}' | head -1 || true)
   if [[ -n "$TARGET_CONTAINER" ]]; then
@@ -325,13 +369,15 @@ if [[ -z "$TARGET_CONTAINER" ]]; then
   fi
 fi
 
-if [[ -n "$TARGET_CONTAINER" ]]; then
+if [[ -n "$TARGET_CONTAINER" && "$ENGINE" != "none" ]]; then
   sec "Container details: $TARGET_CONTAINER"
   CONTAINER_STATUS=$($ENGINE_BIN inspect "$TARGET_CONTAINER" --format '{{.State.Status}}' 2>/dev/null || echo "N/A")
   CONTAINER_RUNNING=$($ENGINE_BIN inspect "$TARGET_CONTAINER" --format '{{.State.Running}}' 2>/dev/null || echo "false")
+  # RestartCount may be absent in some Podman versions; default to 0
   RESTART_COUNT=$($ENGINE_BIN inspect "$TARGET_CONTAINER" --format '{{.RestartCount}}' 2>/dev/null || echo "0")
+  RESTART_COUNT="${RESTART_COUNT:-0}"
 
-  log "Status: $CONTAINER_STATUS | Running: $CONTAINER_RUNNING | Riavvii: $RESTART_COUNT"
+  log "Status: $CONTAINER_STATUS | Running: $CONTAINER_RUNNING | Restarts: $RESTART_COUNT"
 
   if [[ "$CONTAINER_RUNNING" != "true" ]]; then
     err "Container '$TARGET_CONTAINER' is NOT running (status: $CONTAINER_STATUS)"
@@ -340,7 +386,7 @@ if [[ -n "$TARGET_CONTAINER" ]]; then
     ok "Container '$TARGET_CONTAINER' is running"
   fi
 
-  if [[ "$RESTART_COUNT" -gt 3 ]]; then
+  if [[ "$RESTART_COUNT" =~ ^[0-9]+$ && "$RESTART_COUNT" -gt 3 ]]; then
     warn "Container restarted $RESTART_COUNT times — possible crash loop"
     hint "Inspect logs: $ENGINE_BIN logs --tail 100 $TARGET_CONTAINER"
   fi
@@ -360,7 +406,8 @@ if [[ -n "$TARGET_CONTAINER" ]]; then
   sec "Declared port mappings"
   PORTS=$($ENGINE_BIN inspect "$TARGET_CONTAINER" --format '{{json .NetworkSettings.Ports}}' 2>/dev/null || echo "{}")
   log "Ports JSON: $PORTS"
-  if echo "$PORTS" | grep -q "HostPort"; then
+  # Docker uses "HostPort"; Podman uses "host_port" — check both
+  if echo "$PORTS" | grep -qiE '"HostPort"|"host_port"'; then
     ok "Port mapping present"
   else
     err "No port mapping in container — host port is not exposed"
@@ -370,7 +417,7 @@ if [[ -n "$TARGET_CONTAINER" ]]; then
   sec "Networks the container belongs to"
   run "$ENGINE_BIN inspect $TARGET_CONTAINER --format '{{json .NetworkSettings.Networks}}'" || true
 
-  # Podman: network inspect per dettagli extra
+  # Podman: network inspect for extra details
   if [[ "$ENGINE" == "podman" ]]; then
     sec "Podman network list"
     run "podman network ls" || true
@@ -416,7 +463,7 @@ sec "Network interfaces"
 run "ip addr show"
 run "ip route show"
 
-# ── Port forwarding agent specifico per engine ───────────────
+# ── Port forwarding agent (engine-specific) ──────────────────
 if [[ "$ENGINE" == "docker" ]]; then
   sec "docker-proxy bind address"
   PROXY_BIND=$(ss -tlnp | grep ":${TARGET_PORT}" | awk '{print $4}' || true)
@@ -431,7 +478,7 @@ if [[ "$ENGINE" == "docker" ]]; then
 elif [[ "$ENGINE" == "podman" ]]; then
   sec "Podman port forwarding agent (pasta / slirp4netns)"
 
-  # pasta (default da Podman 4.4+ rootless)
+  # pasta (default from Podman 4.4+ rootless)
   PASTA_PID=$(pgrep -a pasta 2>/dev/null | grep "${TARGET_PORT}" || true)
   if [[ -n "$PASTA_PID" ]]; then
     ok "pasta active for port $TARGET_PORT"
@@ -440,7 +487,7 @@ elif [[ "$ENGINE" == "podman" ]]; then
     log "pasta not detected for port $TARGET_PORT"
   fi
 
-  # slirp4netns (precedente a pasta, ancora usato in alcuni setup)
+  # slirp4netns (predecessor to pasta, still used in some setups)
   SLIRP_PID=$(pgrep -a slirp4netns 2>/dev/null || true)
   if [[ -n "$SLIRP_PID" ]]; then
     ok "slirp4netns is running"
@@ -457,7 +504,7 @@ elif [[ "$ENGINE" == "podman" ]]; then
       ok "iptables NAT rule found for port $TARGET_PORT"
       log "$PODMAN_NAT"
     else
-      # prova nftables
+      # try nftables
       if cmd_exists nft; then
         PODMAN_NFT=$(nft list ruleset 2>/dev/null | grep "${TARGET_PORT}" || true)
         if [[ -n "$PODMAN_NFT" ]]; then
@@ -467,11 +514,16 @@ elif [[ "$ENGINE" == "podman" ]]; then
           err "No NAT rule (iptables/nftables) for port $TARGET_PORT — port mapping not active"
           hint "Recreate the container with: podman run -p ${TARGET_PORT}:<internal_port> ..."
         fi
+      else
+        warn "nft not available — cannot verify nftables rules for port $TARGET_PORT"
+        hint "Install nftables: ${PKG_INSTALL} nftables"
+        err "No iptables NAT rule found and nftables unavailable — port mapping may not be active"
+        hint "Recreate the container with: podman run -p ${TARGET_PORT}:<internal_port> ..."
       fi
     fi
   fi
 
-  # Bind address check (rootless: di default 0.0.0.0)
+  # Bind address check (rootless: default 0.0.0.0)
   PROXY_BIND=$(ss -tlnp | grep ":${TARGET_PORT}" | awk '{print $4}' || true)
   if [[ -n "$PROXY_BIND" ]]; then
     log "Port $TARGET_PORT bound to: $PROXY_BIND"
@@ -549,15 +601,15 @@ if [[ "$DISTRO_FAMILY" == "redhat" || "$DISTRO_FAMILY" == "photon" ]]; then
   fi
 fi
 
-# ── 5c. iptables / nftables (tutte le distro) ───────────────
+# ── 5c. iptables / nftables (all distros) ───────────────────
 sec "iptables – container and FORWARD chains"
 
-# Docker usa catene DOCKER / DOCKER-USER; Podman rootful crea catene simili
+# Docker uses DOCKER / DOCKER-USER chains; rootful Podman creates similar chains
 if [[ "$ENGINE" == "docker" ]]; then
   run "iptables -L DOCKER -n -v"       || true
   run "iptables -L DOCKER-USER -n -v"  || true
 elif [[ "$ENGINE" == "podman" ]]; then
-  # Podman crea catene con nomi diversi a seconda del backend
+  # Podman creates chains with different names depending on the backend
   run "iptables -L PODMAN -n -v"       || true
   run "iptables -L PODMAN-FORWARD -n -v" || true
 fi
@@ -671,8 +723,8 @@ if [[ "$BNF" == "0" ]]; then
   hint "Set: sysctl -w net.bridge.bridge-nf-call-iptables=1"
 fi
 
-sec "Container bridge interface ($ENGINE_BRIDGE)"
-if [[ "$ENGINE_BRIDGE" != "(non rilevata)" ]]; then
+sec "Container bridge interface (${ENGINE_BRIDGE:-N/A})"
+if [[ -n "$ENGINE_BRIDGE" && "$ENGINE_BRIDGE" != "(not detected)" ]]; then
   run "ip link show ${ENGINE_BRIDGE}" || warn "Interface ${ENGINE_BRIDGE} not found"
 else
   warn "Container bridge interface not detected"
@@ -721,7 +773,7 @@ CT_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "N
 log "nf_conntrack_max   = $CT_MAX"
 log "nf_conntrack_count = $CT_COUNT"
 
-if [[ "$CT_MAX" != "N/A" && "$CT_COUNT" != "N/A" ]]; then
+if [[ "$CT_MAX" != "N/A" && "$CT_COUNT" != "N/A" && "$CT_MAX" -gt 0 ]]; then
   CT_PCT=$(( CT_COUNT * 100 / CT_MAX ))
   log "conntrack usage    : ${CT_PCT}%"
   if [[ $CT_PCT -ge 90 ]]; then
@@ -738,11 +790,13 @@ fi
 sec "conntrack: SYN_RECV / SYN_SENT states"
 if cmd_exists conntrack; then
   run "conntrack -L -p tcp --dport ${TARGET_PORT} 2>/dev/null | head -30" || true
-  SYN_RECV=$(conntrack -L 2>/dev/null | grep -c "SYN_RECV" || echo "0")
-  SYN_SENT=$(conntrack -L 2>/dev/null | grep -c "SYN_SENT" || echo "0")
+  SYN_RECV=$(conntrack -L 2>/dev/null | grep -c "SYN_RECV" || true)
+  SYN_SENT=$(conntrack -L 2>/dev/null | grep -c "SYN_SENT" || true)
+  SYN_RECV="${SYN_RECV:-0}"
+  SYN_SENT="${SYN_SENT:-0}"
   log "Connections in SYN_RECV : $SYN_RECV"
   log "Connections in SYN_SENT : $SYN_SENT"
-  if [[ "$SYN_RECV" -gt 100 ]]; then
+  if [[ "$SYN_RECV" =~ ^[0-9]+$ && "$SYN_RECV" -gt 100 ]]; then
     warn "High SYN_RECV count ($SYN_RECV) — possible SYN flood or saturated backlog"
   fi
 else
@@ -781,8 +835,8 @@ fi
 sec "Listen queue on port $TARGET_PORT (ss -lnt)"
 SS_LISTEN=$(ss -lnt "sport = :${TARGET_PORT}" 2>/dev/null || true)
 log "$SS_LISTEN"
-RECV_Q=$(echo "$SS_LISTEN" | awk 'NR>1 {print $2}' | head -1 || echo "")
-SEND_Q=$(echo "$SS_LISTEN" | awk 'NR>1 {print $3}' | head -1 || echo "")
+RECV_Q=$(echo "$SS_LISTEN" | awk 'NR>1 {print $2}' | head -1 || true)
+SEND_Q=$(echo "$SS_LISTEN" | awk 'NR>1 {print $3}' | head -1 || true)
 log "  Recv-Q (pending accept): ${RECV_Q:-N/A}  |  Send-Q (max backlog): ${SEND_Q:-N/A}"
 if [[ -n "$RECV_Q" && "$RECV_Q" =~ ^[0-9]+$ && "$RECV_Q" -gt 0 ]]; then
   warn "Recv-Q=$RECV_Q — completed connections not yet accepted by the app"
@@ -790,14 +844,14 @@ if [[ -n "$RECV_Q" && "$RECV_Q" =~ ^[0-9]+$ && "$RECV_Q" -gt 0 ]]; then
 fi
 
 sec "Reverse Path Filtering (rp_filter)"
-for IFACE in $(ip -o link show | awk -F': ' '{print $2}' | grep -v lo); do
+while IFS= read -r IFACE; do
   RPF=$(cat "/proc/sys/net/ipv4/conf/${IFACE}/rp_filter" 2>/dev/null || echo "N/A")
   log "  rp_filter[$IFACE] = $RPF"
   if [[ "$RPF" == "1" ]]; then
     warn "rp_filter=1 (strict) on ${IFACE} — asymmetric routing causes silent SYN drops"
     hint "If asymmetric routing: sysctl -w net.ipv4.conf.${IFACE}.rp_filter=2"
   fi
-done
+done < <(ip -o link show | awk -F': ' '{print $2}' | grep -v lo)
 
 sec "Full routing table"
 run "ip route show table all" || true
@@ -824,9 +878,12 @@ if cmd_exists tcpdump; then
     2>&1 || true)
   echo "$TCPDUMP_OUT" | tee -a "$LOG_FILE"
 
-  SYN_COUNT=$(echo "$TCPDUMP_OUT"    | grep -c "Flags \[S\]"   || echo "0")
-  SYNACK_COUNT=$(echo "$TCPDUMP_OUT" | grep -c "Flags \[S\.\]" || echo "0")
-  RST_COUNT=$(echo "$TCPDUMP_OUT"    | grep -c "Flags \[R"     || echo "0")
+  SYN_COUNT=$(echo "$TCPDUMP_OUT"    | grep -c "Flags \[S\]"   || true)
+  SYNACK_COUNT=$(echo "$TCPDUMP_OUT" | grep -c "Flags \[S\.\]" || true)
+  RST_COUNT=$(echo "$TCPDUMP_OUT"    | grep -c "Flags \[R"     || true)
+  SYN_COUNT="${SYN_COUNT:-0}"
+  SYNACK_COUNT="${SYNACK_COUNT:-0}"
+  RST_COUNT="${RST_COUNT:-0}"
   log "  SYN: $SYN_COUNT  |  SYN-ACK: $SYNACK_COUNT  |  RST: $RST_COUNT"
 
   if [[ "$SYN_COUNT" -gt 0 && "$SYNACK_COUNT" -eq 0 ]]; then
@@ -909,15 +966,15 @@ hdr "11. SUMMARY – POSSIBLE CAUSES AND SOLUTIONS"
 
 log ""
 log "$(_color "${BOLD}${CYAN}" "╔══════════════════════════════════════════════════════════╗")"
-log "$(_color "${BOLD}${CYAN}" "║          DETECTED ISSUES SUMMARY                     ║")"
+log "$(_color "${BOLD}${CYAN}" "║           DETECTED ISSUES SUMMARY                       ║")"
 log "$(_color "${BOLD}${CYAN}" "╚══════════════════════════════════════════════════════════╝")"
-log "  Engine : ${ENGINE}  |  Rootless: ${ENGINE_ROOTLESS}  |  Net backend: ${ENGINE_NET_BACKEND}"
+log "  Engine : ${ENGINE}  |  Rootless: ${ENGINE_ROOTLESS:-N/A}  |  Net backend: ${ENGINE_NET_BACKEND:-N/A}"
 log "  Distro : ${PRETTY_NAME} (${DISTRO_FAMILY})"
 
 if [[ ${#SUMMARY_ISSUES[@]} -eq 0 ]]; then
   log ""
   log "$(_color "${GREEN}" "No critical issues detected automatically.")"
-  log "Check the extended log for deeper analysis: ${BOLD}$LOG_FILE${RESET}"
+  log "Check the extended log for deeper analysis: $LOG_FILE"
 else
   log ""
   log "$(_color "${RED}${BOLD}" "ISSUES FOUND:")"
@@ -926,39 +983,38 @@ else
   done
 fi
 
-echo ""
-echo -e "${YELLOW}${BOLD}COMMON CAUSES CHECKLIST:${RESET}"
-cat <<'EOF'
-  ── GENERIC ───────────────────────────────────────────────────
-  1.  Container not started or in crash loop
-  2.  Missing or incorrect port binding (-p host:container)
-  3.  Process inside container listening on 127.0.0.1 only
-  4.  IP forwarding disabled (net.ipv4.ip_forward=0)
-  5.  ufw active without a rule for the port    [Debian/Ubuntu]
-  6.  firewalld active without a rule for port  [RedHat/Photon]
-  7.  SELinux in Enforcing mode blocking traffic [RedHat]
-  8.  iptables DROP/REJECT rule overrides container rules
-  9.  Cloud Security Group not opening the port externally
-  10. Port conflict: another process is using the same port
-  11. Resources exhausted (OOM killer terminated the container)
-  ── DOCKER SPECIFIC ───────────────────────────────────────────
-  12. docker-proxy listening on 127.0.0.1 instead of 0.0.0.0
-  13. iptables=false in daemon.json → Docker does not create NAT rules
-  14. docker0 bridge missing or in DOWN state
-  ── PODMAN SPECIFIC ───────────────────────────────────────────
-  15. Port < ip_unprivileged_port_start in rootless mode
-  16. User namespaces disabled (max_user_namespaces=0)
-  17. pasta / slirp4netns not running (rootless)
-  18. No iptables/nftables NAT rule (rootful)
-  19. Corrupted or misconfigured CNI/Netavark network
-  20. podman0 / cni0 bridge missing or in DOWN state
-  ── TCP HANDSHAKE (SYN arrives but no SYN-ACK sent) ──────────
-  21. conntrack table full (nf_conntrack_max reached)
-  22. tcp_syncookies=0 under SYN flood
-  23. tcp_max_syn_backlog or somaxconn too low
-  24. rp_filter=1 strict on interface with asymmetric routing
-  25. Recv-Q > 0 — application slow to accept connections
-EOF
+# Write checklist to both stdout and log file via log()
+log ""
+log "$(_color "${YELLOW}${BOLD}" "COMMON CAUSES CHECKLIST:")"
+log "  ── GENERIC ───────────────────────────────────────────────────"
+log "  1.  Container not started or in crash loop"
+log "  2.  Missing or incorrect port binding (-p host:container)"
+log "  3.  Process inside container listening on 127.0.0.1 only"
+log "  4.  IP forwarding disabled (net.ipv4.ip_forward=0)"
+log "  5.  ufw active without a rule for the port    [Debian/Ubuntu]"
+log "  6.  firewalld active without a rule for port  [RedHat/Photon]"
+log "  7.  SELinux in Enforcing mode blocking traffic [RedHat]"
+log "  8.  iptables DROP/REJECT rule overrides container rules"
+log "  9.  Cloud Security Group not opening the port externally"
+log "  10. Port conflict: another process is using the same port"
+log "  11. Resources exhausted (OOM killer terminated the container)"
+log "  ── DOCKER SPECIFIC ───────────────────────────────────────────"
+log "  12. docker-proxy listening on 127.0.0.1 instead of 0.0.0.0"
+log "  13. iptables=false in daemon.json → Docker does not create NAT rules"
+log "  14. docker0 bridge missing or in DOWN state"
+log "  ── PODMAN SPECIFIC ───────────────────────────────────────────"
+log "  15. Port < ip_unprivileged_port_start in rootless mode"
+log "  16. User namespaces disabled (max_user_namespaces=0)"
+log "  17. pasta / slirp4netns not running (rootless)"
+log "  18. No iptables/nftables NAT rule (rootful)"
+log "  19. Corrupted or misconfigured CNI/Netavark network"
+log "  20. podman0 / cni0 bridge missing or in DOWN state"
+log "  ── TCP HANDSHAKE (SYN arrives but no SYN-ACK sent) ──────────"
+log "  21. conntrack table full (nf_conntrack_max reached)"
+log "  22. tcp_syncookies=0 under SYN flood"
+log "  23. tcp_max_syn_backlog or somaxconn too low"
+log "  24. rp_filter=1 strict on interface with asymmetric routing"
+log "  25. Recv-Q > 0 — application slow to accept connections"
 
 if [[ ${#SUMMARY_HINTS[@]} -gt 0 ]]; then
   log ""
@@ -969,12 +1025,12 @@ if [[ ${#SUMMARY_HINTS[@]} -gt 0 ]]; then
 fi
 
 log ""
-log "$(_color "${BOLD}" "Full log saved to:      ") $(_color "${CYAN}" "$LOG_FILE")"
-log "$(_color "${BOLD}" "Analysed port:         ") ${TARGET_PORT}"
-log "$(_color "${BOLD}" "Container:             ") ${TARGET_CONTAINER:-'(none detected)'}"
-log "$(_color "${BOLD}" "Engine:                ") ${ENGINE} (rootless: ${ENGINE_ROOTLESS}, backend: ${ENGINE_NET_BACKEND})"
-log "$(_color "${BOLD}" "Distro:                ") ${PRETTY_NAME} (${DISTRO_FAMILY})"
-log "$(_color "${BOLD}" "Timestamp:             ") $(date)"
+log "$(_color "${BOLD}" "Full log saved to:") $LOG_FILE"
+log "$(_color "${BOLD}" "Analysed port:    ") ${TARGET_PORT}"
+log "$(_color "${BOLD}" "Container:        ") ${TARGET_CONTAINER:-'(none detected)'}"
+log "$(_color "${BOLD}" "Engine:           ") ${ENGINE} (rootless: ${ENGINE_ROOTLESS:-N/A}, backend: ${ENGINE_NET_BACKEND:-N/A})"
+log "$(_color "${BOLD}" "Distro:           ") ${PRETTY_NAME} (${DISTRO_FAMILY})"
+log "$(_color "${BOLD}" "Timestamp:        ") $(date)"
 log ""
 
 hdr "END OF DIAGNOSTICS"

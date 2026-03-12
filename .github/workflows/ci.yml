@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  lint:
+    name: ShellCheck + syntax
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: ShellCheck (warning level)
+        run: shellcheck -S warning port-not-responding.sh
+
+      - name: bash -n syntax check
+        run: bash -n port-not-responding.sh
+
+  test:
+    name: bats unit tests
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bats-core
+        run: |
+          sudo apt-get install -y bats
+
+      - name: Run tests
+        run: bats test/port-not-responding.bats

@@ -1,0 +1,41 @@
+---
+# GitLab CI pipeline for port-not-responding.sh
+# Runs on GitLab.com shared runners (ubuntu-based Docker image).
+# Note: if you are hosting this on GitHub, use .github/workflows/ci.yml instead.
+
+stages:
+  - lint
+  - test
+
+default:
+  image: ubuntu:24.04
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq shellcheck bats
+
+shellcheck:
+  stage: lint
+  script:
+    - shellcheck -S warning port-not-responding.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+bash-syntax:
+  stage: lint
+  script:
+    - bash -n port-not-responding.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+bats-tests:
+  stage: test
+  needs:
+    - shellcheck
+    - bash-syntax
+  script:
+    - bats test/port-not-responding.bats
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
